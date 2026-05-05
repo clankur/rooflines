@@ -1,0 +1,6 @@
+*.html
+*.quarto_ipynb*
+_site/
+_freeze/
+.quarto/
+rooflines_files/

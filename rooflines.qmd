@@ -1,0 +1,294 @@
+---
+title: "Roofline Model Analysis"
+subtitle: "Compute and Memory Bounds for Dense & Sparse Transformers"
+format:
+  live-html:
+    code-fold: false
+    toc: true
+    number-sections: true
+filters:
+  - live
+---
+
+::: {.callout-tip}
+## Sources
+
+These notes are derived from:
+
+- [How GPT, Claude, and Gemini are actually trained and served – Reiner Pope](https://www.youtube.com/watch?v=xmkSf5IS-zw)
+- [JAX Scaling Book — Roofline Analysis](https://jax-ml.github.io/scaling-book/roofline/)
+:::
+
+## Accelerator Specifications
+
+We characterize hardware with three peak throughputs:
+
+- **Accelerator FLOPs/s** — peak BF16 floating-point operations per second
+- **Memory Bandwidth bytes/s** — HBM bandwidth
+- **Network Bandwidth bytes/s** — inter-chip interconnect (ICI) bandwidth
+
+```{pyodide}
+from collections import namedtuple
+
+AcceleratorSpec = namedtuple('AcceleratorSpec', ['bf16_flops', 'hbm_bw', 'ici_bw'])
+
+ACCELERATORS = {
+    'h100': AcceleratorSpec(bf16_flops=9.89e14, hbm_bw=3.35e12, ici_bw=0.9e12),
+    'v6e' : AcceleratorSpec(bf16_flops=9.1e14,  hbm_bw=1.76e12, ici_bw=0.8e12),
+}
+```
+
+## Problem Setup
+
+Consider a single forward-pass step of a Mixture-of-Experts (MoE) transformer layer:
+
+```{pyodide}
+BATCH_SIZE = 256
+N_ACTIVE = 1e12
+L = 4e6
+TOKEN_BYTES_BF16 = 2
+
+chip = ACCELERATORS['h100']
+flops = chip.bf16_flops
+hbm_bandwidth = chip.hbm_bw
+```
+
+## Where Does the Time Go?
+
+### Compute Time
+
+The number of floating-point operations for the FFN projections:
+
+$$
+\text{Computation FLOPs} = 2 \cdot B \cdot N_{\text{active}}
+$$
+
+The factor of 2 comes from the multiply-accumulate — each element of a dot product contributes one multiplication and one addition.
+
+**Why 2?** Given input vector of size $K$ and weight matrix of shape $(K, N)$, we compute:
+
+$$
+\text{einsum}(K,\; KN \to N)
+$$
+
+This does $K \cdot N$ multiplications and $(K-1) \cdot N$ additions, giving approximately $2KN = 2 \cdot N_{\text{params}}$ FLOPs per token.
+
+For sparse (MoE) models with an activated ratio:
+
+$$
+\text{Projection FLOPs} \approx 2 \cdot N_{\text{params}} \cdot \frac{\text{experts selected}}{\text{total experts}}
+$$
+
+::: {.callout-note}
+This drops attention FLOPs for simplicity — the FFN is the dominating factor *at short context lengths*. At long contexts, attention's contribution becomes significant. In the original lecture, Reiner does not include the factor of 2 for mul+add.
+:::
+
+::: {.callout-warning collapse="true"}
+## Pedantic FLOP Counting
+
+If we want to be precise, we've been undercounting adds. A dot product of two vectors of size $K$ does $K$ multiplications and $K - 1$ additions — not $K$ of each.
+
+**Dot product:** $\text{einsum}(K, K \to 1)$
+
+- $K$ muls, $K - 1$ adds
+
+**Matrix-vector product:** given a vector of size $K$ and a matrix of shape $(N, K)$:
+$\text{einsum}(K, KN \to N)$
+
+- $K \cdot N$ muls, $(K-1) \cdot N$ adds
+
+**For the FFN** with $W_{\text{up}} \in \mathbb{R}^{M \times F}$ and $W_{\text{down}} \in \mathbb{R}^{F \times M}$:
+
+- $W_{\text{up}}$: $M \cdot F$ muls + $(M-1) \cdot F$ adds
+- $W_{\text{down}}$: $F \cdot M$ muls + $(F-1) \cdot M$ adds
+- Total: $\approx 4MF \approx 2 \cdot (N_{\text{up}} + N_{\text{down}})$
+
+**If projections are sparse (MoE):**
+
+$$
+\text{activated\_ratio} = \frac{\text{NUM\_SELECTED}}{\text{TOTAL\_EXPERTS}}
+$$
+$$
+\text{FFN FLOPs} \approx 2 \cdot (M \cdot F) \cdot \text{activated\_ratio}
+$$
+
+**TLDR:** the $2 \times$ approximation lumps muls and adds together. It slightly overcounts (by $N$ adds per projection), but makes everything easier to track and is standard practice.
+:::
+
+The compute time:
+
+$$
+T_{\text{math}} = \frac{\text{Computation FLOPs}}{\text{Accelerator FLOPs/s}}
+$$
+
+```{pyodide}
+computation_flops = BATCH_SIZE * N_ACTIVE * 2
+t_math = computation_flops / flops
+print(f"T_math = {t_math:.4f} s")
+```
+
+### Memory (Communication) Time
+
+Memory traffic includes loading activated weights and the KV-cache:
+
+$$
+\text{Communication Bytes} = N_{\text{active}} + 2 \cdot B \cdot L
+$$
+
+The memory time:
+
+$$
+T_{\text{mem}} = \frac{\text{Communication Bytes}}{\text{Memory Bandwidth bytes/s}}
+$$
+
+```{pyodide}
+communication_bytes = N_ACTIVE + BATCH_SIZE * L * TOKEN_BYTES_BF16
+t_memory = communication_bytes / hbm_bandwidth
+print(f"T_mem  = {t_memory:.4f} s")
+```
+
+### Execution Time Bounds
+
+$$
+T_{\text{lower}} = \max(T_{\text{math}},\; T_{\text{mem}})
+$$
+$$
+T_{\text{upper}} = T_{\text{math}} + T_{\text{mem}}
+$$
+
+The lower bound assumes perfect overlap (pipelining); the upper bound assumes zero overlap. Whoever is the dominating component is what we are bound by.
+
+Note that $T_{\text{upper}} \leq 2 \cdot T_{\text{lower}}$ always — so the worst case is only 2x off from the best case.
+
+```{pyodide}
+t_lower = max(t_math, t_memory)
+t_upper = t_math + t_memory
+print(f"T_exec ∈ [{t_lower:.4f}, {t_upper:.4f}] s")
+print(f"Bound:  {'compute' if t_math > t_memory else 'memory'}")
+```
+
+## Arithmetic Intensity and the Roofline
+
+### Definition
+
+$$
+\text{Intensity(Computation)} = \frac{\text{Computation FLOPs}}{\text{Communication Bytes}} \quad \left[\frac{\text{FLOPs}}{\text{byte}}\right]
+$$
+
+$$
+\text{Intensity(Accelerator)} = \frac{\text{Accelerator FLOPs/s}}{\text{Memory Bandwidth bytes/s}} \quad \left[\frac{\text{FLOPs}}{\text{byte}}\right]
+$$
+
+Determining what we're bound by:
+
+$$
+T_{\text{math}} > T_{\text{mem}}
+\iff \frac{\text{Computation FLOPs}}{\text{Accelerator FLOPs/s}} > \frac{\text{Communication Bytes}}{\text{Memory Bandwidth bytes/s}}
+$$
+$$
+\iff \text{Intensity(Computation)} > \text{Intensity(Accelerator)}
+$$
+
+The accelerator intensity is the **ridge point** — the arithmetic intensity where the chip transitions from memory-bound to compute-bound.
+
+```{pyodide}
+op_intensity = lambda computation_flops, communication_bytes: computation_flops / communication_bytes
+
+I_ridge = flops / hbm_bandwidth
+print(f"Intensity(H100) = {I_ridge:.1f} FLOPs/byte")
+```
+
+### Example: Dot Product
+
+For $\mathbf{x}, \mathbf{y} \in \text{BF16}^N$, computing $\mathbf{x} \cdot \mathbf{y}$:
+
+- Load $\mathbf{x}$ and $\mathbf{y}$ from memory, write back 1 scalar result
+- Communication Bytes $= 2 \cdot 2N + 2 = 4N + 2$
+- The dot product does $N$ muls, $N - 1$ adds
+- Computation FLOPs $= 2N - 1$
+
+$$
+\text{Intensity(dot product)} = \frac{2N - 1}{4N + 2} \;\xrightarrow{N \to \infty}\; \frac{1}{2}
+$$
+
+A dot product achieves at most **0.5 FLOPs/byte** — far below any modern accelerator's ridge point. It is always memory-bound.
+
+### Example: Matrix Multiplication
+
+For $X \in \text{BF16}^{B \times D}$, $Y \in \text{BF16}^{D \times F}$, computing $XY$:
+
+- Load $X$ and $Y$, write back result: Communication Bytes $= 2(BD + DF + BF)$
+- The matmul does $B \cdot F$ dot products, each of size $D$
+- Computation FLOPs $= 2 \cdot B \cdot D \cdot F$
+
+$$
+\text{Intensity(matmul)} = \frac{BDF}{BD + DF + BF}
+$$
+
+When $B$ is small relative to $D$ and $F$, the denominator is dominated by $DF$:
+
+$$
+\text{Intensity(matmul)} \approx \frac{BDF}{DF} = B
+$$
+
+We are compute-bound when:
+
+$$
+\text{Intensity(matmul)} > \text{Intensity(Accelerator)} \iff B > \text{Intensity(Accelerator)}
+$$
+
+**Rule of thumb:** batch size should exceed the chip's ridge-point intensity to saturate compute.
+
+```{pyodide}
+print(f"For compute-bound matmul on H100: B > {I_ridge:.0f}")
+```
+
+## Network Roofline (Multi-Chip)
+
+Now $T_{\text{comms}}$ refers to communication *between chips* over ICI, not memory.
+
+### Sharding Along D
+
+Consider $X \in \mathbb{R}^{B \times D}$, $W \in \mathbb{R}^{D \times F}$ sharded along $D$ across 2 chips:
+
+```
+Chip 0: A = X[:, :D//2] @ W[:D//2, :]
+Chip 1: B = X[:, D//2:] @ W[D//2:, :]
+Result: A + B  (requires all-reduce)
+```
+
+- Computation FLOPs $= 2 \cdot B \cdot D \cdot F$ (total across both chips)
+- Communication Bytes (all-reduce over ICI) $= 2 \cdot B \cdot F$
+
+$$
+T_{\text{math}} = \frac{2 \cdot B \cdot D \cdot F}{\text{Accelerator FLOPs/s}}
+$$
+$$
+T_{\text{comms}} = \frac{2 \cdot B \cdot F}{\text{Network Bandwidth bytes/s}}
+$$
+
+The network intensity:
+
+$$
+\text{Intensity(network)} = \frac{2BDF}{2BF} = D
+$$
+
+$$
+\text{Intensity(Network)} = \frac{\text{Accelerator FLOPs/s}}{\text{Network Bandwidth bytes/s}}
+$$
+
+We are compute-bound over the network when:
+
+$$
+D > \frac{\text{Accelerator FLOPs/s}}{\text{Network Bandwidth bytes/s}}
+$$
+
+The model dimension must exceed the ratio of peak FLOPs to interconnect bandwidth.
+
+```{pyodide}
+ici_bandwidth = chip.ici_bw
+I_ridge_net = flops / ici_bandwidth
+print(f"Intensity(H100 network) = {I_ridge_net:.0f} FLOPs/byte")
+print(f"Network compute-bound when D > {I_ridge_net:.0f}")
+```
+
