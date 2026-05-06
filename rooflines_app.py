@@ -109,9 +109,8 @@ def _(mo):
         with open(_specs_path) as f:
             PRESETS = _json.load(f)
     except Exception:
-        import urllib.request as _ur
-        with _ur.urlopen("./accelerators.json") as f:
-            PRESETS = _json.load(f)
+        from pyodide.http import open_url as _open_url
+        PRESETS = _json.loads(_open_url("./accelerators.json").read())
 
     chip_dropdown = mo.ui.dropdown(
         options=list(PRESETS.keys()),
