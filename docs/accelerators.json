@@ -1,0 +1,74 @@
+{
+  "A100": {
+    "bf16_flops": 3.1e14,
+    "hbm_bw": 2.0e12,
+    "ici_bw": 3.0e11,
+    "source": "jax-ml/scaling-book, NVLink 3.0: 12 links × 25 GB/s"
+  },
+  "H100": {
+    "bf16_flops": 9.9e14,
+    "hbm_bw": 3.4e12,
+    "ici_bw": 4.5e11,
+    "source": "jax-ml/scaling-book, NVLink 4.0: 18 links × 25 GB/s"
+  },
+  "H200": {
+    "bf16_flops": 9.9e14,
+    "hbm_bw": 4.8e12,
+    "ici_bw": 4.5e11,
+    "source": "jax-ml/scaling-book, same NVLink as H100"
+  },
+  "B200": {
+    "bf16_flops": 2.3e15,
+    "hbm_bw": 8.0e12,
+    "ici_bw": 9.0e11,
+    "source": "jax-ml/scaling-book, NVLink 5.0: 18 links × 50 GB/s"
+  },
+  "B300": {
+    "bf16_flops": 3.5e15,
+    "hbm_bw": 8.0e12,
+    "ici_bw": 1.8e12,
+    "source": "nvidia.com/b300, FP16 dense=3500 TFLOPS, HBM3e 8 TB/s, NVLink 5 1.8 TB/s"
+  },
+  "TPU v3": {
+    "bf16_flops": 1.4e14,
+    "hbm_bw": 9.0e11,
+    "ici_bw": 2.0e11,
+    "source": "jax-ml/scaling-book, ICI bidi per link"
+  },
+  "TPU v4": {
+    "bf16_flops": 2.75e14,
+    "hbm_bw": 1.2e12,
+    "ici_bw": 9.0e10,
+    "source": "docs.cloud.google.com/tpu/docs/v4, 275 TFLOPS bf16, 1200 GBps HBM, 6 ICI links"
+  },
+  "TPU v5e": {
+    "bf16_flops": 1.97e14,
+    "hbm_bw": 8.1e11,
+    "ici_bw": 9.0e10,
+    "source": "jax-ml/scaling-book, ICI bidi per link"
+  },
+  "TPU v5p": {
+    "bf16_flops": 4.59e14,
+    "hbm_bw": 2.8e12,
+    "ici_bw": 1.8e11,
+    "source": "jax-ml/scaling-book, ICI bidi per link"
+  },
+  "TPU v6e": {
+    "bf16_flops": 9.2e14,
+    "hbm_bw": 1.6e12,
+    "ici_bw": 1.8e11,
+    "source": "jax-ml/scaling-book, ICI bidi per link"
+  },
+  "TPU v7 (Ironwood)": {
+    "bf16_flops": 2.307e15,
+    "hbm_bw": 7.38e12,
+    "ici_bw": 1.2e12,
+    "source": "docs.cloud.google.com/tpu/docs/tpu7x, BF16=2307 TFLOPS, HBM=7380 GiB/s, ICI=1200 GB/s per chip"
+  },
+  "Custom": {
+    "bf16_flops": 1e15,
+    "hbm_bw": 3e12,
+    "ici_bw": 1e12,
+    "source": "user-defined"
+  }
+}
