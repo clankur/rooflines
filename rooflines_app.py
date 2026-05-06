@@ -1,15 +1,14 @@
 import marimo
 
 __generated_with = "0.23.5"
-app = marimo.App(width="medium")
+app = marimo.App(width="full")
 
 
 @app.cell
-def _(mo):
-    mo.md(r"""
-    # Roofline Model Analysis
-    """)
-    return
+def _():
+    import marimo as mo
+
+    return (mo,)
 
 
 @app.cell
@@ -103,47 +102,6 @@ def _(fetch_button, model_id_input, trending_table):
 
 
 @app.cell
-def _(
-    batch_size_input,
-    fetch_button,
-    ffn_dim_input,
-    hf_error,
-    hf_spec,
-    mo,
-    model_dim_input,
-    model_id_input,
-    n_active_input,
-    trending_table,
-):
-    import pandas as pd
-
-    search_bar = mo.hstack([model_id_input, fetch_button], justify="start", gap=1, widths=[4, 1])
-    workload = mo.hstack([batch_size_input, n_active_input, model_dim_input, ffn_dim_input], justify="start", gap=1)
-    left_col = mo.vstack([search_bar, trending_table, workload])
-
-    _card = None
-    if hf_error:
-        _card = mo.md(f"⚠️ `{hf_error}`")
-    elif hf_spec:
-        params_str = f"{hf_spec['total_params']/1e9:.1f}B" if hf_spec['total_params'] else "—"
-        moe_str = f"{hf_spec['experts_per_tok']}/{hf_spec['num_experts']}" if hf_spec["num_experts"] else "—"
-        df = pd.DataFrame({
-            hf_spec["model_id"]: {
-                "Hidden dim (D)": hf_spec["hidden_size"],
-                "FFN dim (F)": hf_spec["intermediate_size"],
-                "Layers": hf_spec["num_hidden_layers"],
-                "Params": params_str,
-                "Active": f"{hf_spec['active_params']:.2e}",
-                "MoE": moe_str,
-            }
-        })
-        _card = mo.ui.table(df, show_column_summaries=False, selection=None)
-
-    mo.hstack([left_col, _card] if _card else [left_col], justify="start", gap=2)
-    return
-
-
-@app.cell
 def _(mo):
     import json as _json
 
@@ -161,7 +119,7 @@ def _(mo):
     chip_select = mo.ui.multiselect(
         options=["Custom"] + list(PRESETS.keys()),
         value=["H100"] if "H100" in PRESETS else [list(PRESETS.keys())[0]],
-        label="Chips",
+        label="Chip",
     )
     custom_flops_input = mo.ui.text(value="1.00e+15", label="FLOPs/s")
     custom_hbm_input = mo.ui.text(value="3.35e+12", label="HBM BW (B/s)")
@@ -185,9 +143,9 @@ def _(hf_spec, mo):
     n_active_default = f"{hf_spec['active_params']:.2e}" if hf_spec else "1.00e+12"
 
     batch_size_input = mo.ui.text(value="256", label="Batch size (B)")
-    n_active_input = mo.ui.text(value=n_active_default, label="Active params (N_active)")
-    model_dim_input = mo.ui.text(value=D_default, label="Model dim (D)")
-    ffn_dim_input = mo.ui.text(value=F_default, label="FFN dim (F)")
+    n_active_input = mo.ui.text(value=n_active_default, label="N_active")
+    model_dim_input = mo.ui.text(value=D_default, label="D")
+    ffn_dim_input = mo.ui.text(value=F_default, label="F")
     return (
         batch_size_input,
         dp_input,
@@ -276,48 +234,161 @@ def _(
     return N, chip_results
 
 
+# --- 3-column workbench layout ---
+
+
 @app.cell
 def _(
+    N,
+    batch_size_input,
+    chip_results,
     chip_select,
     custom_flops_input,
     custom_hbm_input,
     custom_ici_input,
     dp_input,
+    fetch_button,
+    ffn_dim_input,
+    hf_error,
+    hf_spec,
     mo,
+    model_dim_input,
+    model_id_input,
+    n_active_input,
     tp_input,
+    trending_table,
 ):
-    _custom_row = mo.hstack([custom_flops_input, custom_hbm_input, custom_ici_input], justify="start", gap=1)
-    mo.vstack([
-        chip_select,
-        *([_custom_row] if "Custom" in (chip_select.value or []) else []),
-        mo.md("**Mesh**"),
-        mo.hstack([tp_input, dp_input], justify="start", gap=1),
-    ])
-    return
-
-
-@app.cell
-def _(N, chip_results, mo):
     import pandas as _pd
 
-    rows = []
-    for r in chip_results:
-        rows.append({
-            "Chip": r["chip"],
-            "Chips": N,
-            "FLOPs/s": f"{r['chip_flops']:.2e}",
-            "HBM BW": f"{r['chip_hbm']:.2e}",
-            "ICI BW": f"{r['chip_ici']:.2e}",
-            "T_math": f"{r['t_math']:.2e} s",
-            "T_mem": f"{r['t_mem']:.2e} s",
-            "T_net": f"{r['t_net']:.2e} s" if r["t_net"] > 0 else "—",
-            "T_exec": f"[{r['t_lower']:.2e}, {r['t_upper']:.2e}] s",
-            "Regime": f"{r['regime']}-bound",
-            "Mem Ridge": f"{r['ridge_mem']:.0f}",
-            "Net Ridge": f"{r['ridge_net']:.0f}",
-        })
+    # ── LEFT COLUMN ──────────────────────────────────────────────
 
-    mo.ui.table(_pd.DataFrame(rows), show_column_summaries=False, selection=None) if rows else None
+    # Model spec card
+    if hf_error:
+        _spec_card = mo.callout(mo.md(f"`{hf_error}`"), kind="warn")
+    elif hf_spec:
+        params_str = f"{hf_spec['total_params']/1e9:.1f}B" if hf_spec['total_params'] else "—"
+        moe_str = f"{hf_spec['experts_per_tok']}/{hf_spec['num_experts']}" if hf_spec["num_experts"] else "—"
+        _spec_df = _pd.DataFrame({
+            hf_spec["model_id"]: {
+                "Hidden D": f"{hf_spec['hidden_size']:,}",
+                "FFN F": f"{hf_spec['intermediate_size']:,}",
+                "Layers": hf_spec["num_hidden_layers"],
+                "Params": params_str,
+                "Active": f"{hf_spec['active_params']:.2e}",
+                "MoE": moe_str,
+            }
+        })
+        _spec_card = mo.ui.table(_spec_df, show_column_summaries=False, selection=None)
+    else:
+        _spec_card = mo.md("*No model loaded*")
+
+    _model_name = hf_spec["model_id"] if hf_spec else model_id_input.value
+    _model_section = _spec_card
+
+    # Params section
+    _params_section = mo.vstack([
+        mo.md("**params**"),
+        batch_size_input,
+        n_active_input,
+        mo.hstack([model_dim_input, ffn_dim_input], justify="start", gap=1),
+    ])
+
+    # Hardware + mesh section
+    _custom_row = mo.hstack([custom_flops_input, custom_hbm_input, custom_ici_input], justify="start", gap=1)
+    _hw_section = mo.vstack([
+        mo.md("**hardware + mesh**"),
+        chip_select,
+        *([_custom_row] if "Custom" in (chip_select.value or []) else []),
+        tp_input,
+        dp_input,
+    ])
+
+    left_col = mo.vstack([_model_section, _params_section, _hw_section], gap=2)
+
+    # ── MIDDLE COLUMN ────────────────────────────────────────────
+
+    # Stat cards for the first chip result (or placeholders)
+    if chip_results:
+        r = chip_results[0]
+        _bottleneck = r["regime"]
+
+        def _stat(label, val, is_bottleneck=False):
+            style = "background: #fff3cd; border: 2px solid #ffc107; border-radius: 8px; padding: 12px; text-align: center;" if is_bottleneck else "background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 8px; padding: 12px; text-align: center;"
+            suffix = " <-- bottleneck" if is_bottleneck else ""
+            return mo.md(f"""<div style="{style}">
+<div style="font-size: 0.8em; color: #666;">{label}{suffix}</div>
+<div style="font-size: 1.4em; font-weight: bold;">{val:.2e} s</div>
+</div>""")
+
+        _t_cards = mo.hstack([
+            _stat("T_math", r["t_math"], _bottleneck == "COMPUTE"),
+            _stat("T_mem", r["t_mem"], _bottleneck == "MEMORY"),
+            _stat("T_net", r["t_net"], _bottleneck == "NETWORK") if r["t_net"] > 0 else _stat("T_net", 0),
+            _stat("T_exec", r["t_lower"]),
+        ], justify="start", gap=1)
+
+        _regime_badge = mo.callout(
+            mo.md(f"**{r['regime']}-bound** · T_exec = {r['t_lower']:.2e}s · ridge(mem) = {r['ridge_mem']:.0f} · ridge(net) = {r['ridge_net']:.0f}"),
+            kind="warn" if _bottleneck == "NETWORK" else ("success" if _bottleneck == "COMPUTE" else "info"),
+        )
+    else:
+        _t_cards = mo.md("*Select a chip to see timing breakdown*")
+        _regime_badge = mo.md("")
+
+    _chart_placeholder = mo.md(
+        '<div style="border: 2px dashed #ccc; border-radius: 8px; height: 300px; display: flex; align-items: center; justify-content: center; color: #999;">chart placeholder</div>'
+    )
+
+    mid_col = mo.vstack([_regime_badge, _chart_placeholder, _t_cards], gap=2)
+
+    # ── RIGHT COLUMN ─────────────────────────────────────────────
+
+    if chip_results:
+        _cols = {}
+        for r in chip_results:
+            _cols[f"{r['chip']} x{N}"] = {
+                "FLOPs/s": f"{r['chip_flops']:.2e}",
+                "HBM BW": f"{r['chip_hbm']:.2e}",
+                "ICI BW": f"{r['chip_ici']:.2e}",
+                "Regime": f"{r['regime']}-bound",
+                "T_math": f"{r['t_math']:.2e}",
+                "T_mem": f"{r['t_mem']:.2e}",
+                "T_net": f"{r['t_net']:.2e}" if r["t_net"] > 0 else "—",
+                "T_exec": f"{r['t_lower']:.2e}",
+                "Ridge (mem)": f"{r['ridge_mem']:.0f}",
+                "Ridge (net)": f"{r['ridge_net']:.0f}",
+            }
+        _results_table = mo.vstack([
+            mo.md("**results**"),
+            mo.ui.table(_pd.DataFrame(_cols), show_column_summaries=False, selection=None),
+        ], gap=1)
+    else:
+        _results_table = mo.md("*No results yet*")
+
+    _swap_model = mo.accordion({
+        "swap model": mo.vstack([
+            mo.hstack([model_id_input, fetch_button], justify="start", gap=1, widths=[4, 1]),
+            trending_table,
+        ]),
+    })
+
+    right_col = mo.vstack([
+        mo.md(f'<span style="border: 2px solid #198754; border-radius: 20px; padding: 4px 16px; font-weight: bold; color: #198754;">{_model_name}</span>'),
+        _swap_model,
+        _results_table,
+    ], gap=2)
+
+    # ── ASSEMBLE ─────────────────────────────────────────────────
+
+    mo.vstack([
+        mo.md("# Rooflines · workbench"),
+        mo.hstack(
+            [left_col, mid_col, right_col],
+            justify="start",
+            gap=3,
+            widths=[3, 6, 3],
+        ),
+    ])
     return
 
 
@@ -410,13 +481,6 @@ def _(mo):
     The ring all-reduce factor $2 \cdot (N-1)/N$ accounts for the reduce-scatter + all-gather phases; it approaches 2 for large $N$.
     """)
     return
-
-
-@app.cell
-def _():
-    import marimo as mo
-
-    return (mo,)
 
 
 if __name__ == "__main__":
