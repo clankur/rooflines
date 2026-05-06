@@ -15,7 +15,7 @@ def _(mo):
 @app.cell
 def _(mo):
     model_id_input = mo.ui.text(
-        value="mistralai/Mixtral-8x7B-v0.1",
+        value="google/gemma-4-31B",
         label="HuggingFace model ID",
         full_width=True,
     )
@@ -77,10 +77,12 @@ def _(fetch_button, model_id_input):
 
 
 @app.cell
-def _(fetch_button, hf_error, hf_spec, mo, model_id_input):
+def _(batch_size_input, fetch_button, ffn_dim_input, hf_error, hf_spec, mo, model_dim_input, model_id_input, n_active_input):
     import pandas as pd
 
-    search_bar = mo.hstack([model_id_input, fetch_button], justify="start", gap=1)
+    search_bar = mo.hstack([model_id_input, fetch_button], justify="start", gap=1, widths=[4, 1])
+    workload = mo.hstack([batch_size_input, n_active_input, model_dim_input, ffn_dim_input], justify="start", gap=1)
+    left_col = mo.vstack([search_bar, workload])
 
     _card = None
     if hf_error:
@@ -100,7 +102,7 @@ def _(fetch_button, hf_error, hf_spec, mo, model_id_input):
         })
         _card = mo.ui.table(df, show_column_summaries=False, selection=None)
 
-    mo.hstack([search_bar, _card] if _card else [search_bar], justify="start", gap=2)
+    mo.hstack([left_col, _card] if _card else [left_col], justify="start", gap=2)
     return
 
 
@@ -119,33 +121,18 @@ def _(mo):
         from pyodide.http import open_url as _open_url
         PRESETS = _json.loads(_open_url(_REMOTE).read())
 
-    chip_dropdown = mo.ui.dropdown(
+    chip_select = mo.ui.multiselect(
         options=list(PRESETS.keys()),
-        value="H100" if "H100" in PRESETS else list(PRESETS.keys())[0],
-        label="Chip preset",
+        value=["H100"] if "H100" in PRESETS else [list(PRESETS.keys())[0]],
+        label="Chips",
     )
-    return PRESETS, chip_dropdown
+    return PRESETS, chip_select
 
 
 @app.cell
-def _(PRESETS, chip_dropdown, hf_spec, mo):
-    def _sci(value, label):
-        return mo.ui.text(value=f"{value:.2e}", label=label)
-
-    preset = PRESETS[chip_dropdown.value]
-
-    bf16_flops_input = _sci(preset["bf16_flops"], "Accelerator FLOPs/s")
-    hbm_bw_input = _sci(preset["hbm_bw"], "Memory BW (bytes/s)")
-    ici_bw_input = _sci(preset["ici_bw"], "Network BW (bytes/s)")
-
-    n_chips_input = mo.ui.slider(
-        start=1, stop=16384, value=8, step=1, label="Number of chips (N)", show_value=True
-    )
-    sharding_select = mo.ui.multiselect(
-        options=["Tensor Parallel", "Data Parallel"],
-        value=["Tensor Parallel"],
-        label="Sharding strategies",
-    )
+def _(hf_spec, mo):
+    tp_input = mo.ui.slider(start=1, stop=64, value=8, step=1, label="TP", show_value=True)
+    dp_input = mo.ui.slider(start=1, stop=4096, value=1, step=1, label="DP", show_value=True)
 
     D_default = str(hf_spec["hidden_size"]) if hf_spec else "12288"
     F_default = str(hf_spec["intermediate_size"]) if hf_spec else "49152"
@@ -153,173 +140,113 @@ def _(PRESETS, chip_dropdown, hf_spec, mo):
 
     batch_size_input = mo.ui.text(value="256", label="Batch size (B)")
     n_active_input = mo.ui.text(value=n_active_default, label="Active params (N_active)")
-    seq_len_input = _sci(4e6, "Sequence length (L)")
     model_dim_input = mo.ui.text(value=D_default, label="Model dim (D)")
     ffn_dim_input = mo.ui.text(value=F_default, label="FFN dim (F)")
     return (
         batch_size_input,
-        bf16_flops_input,
         ffn_dim_input,
-        hbm_bw_input,
-        ici_bw_input,
         model_dim_input,
+        dp_input,
         n_active_input,
-        n_chips_input,
-        seq_len_input,
-        sharding_select,
+        tp_input,
     )
 
 
 @app.cell
-def _(
-    batch_size_input,
-    bf16_flops_input,
-    ffn_dim_input,
-    hbm_bw_input,
-    ici_bw_input,
-    model_dim_input,
-    n_active_input,
-    n_chips_input,
-    seq_len_input,
-    sharding_select,
-):
+def _(PRESETS, batch_size_input, chip_select, dp_input, ffn_dim_input, model_dim_input, tp_input):
     def _parse(text_input):
         try:
             return float(text_input.value)
         except ValueError:
             return 1.0
 
-    flops = _parse(bf16_flops_input)
-    hbm_bandwidth = _parse(hbm_bw_input)
-    ici_bandwidth = _parse(ici_bw_input)
-    N = n_chips_input.value
-    strategies = sharding_select.value or ["Tensor Parallel"]
+    TP = tp_input.value
+    DP = dp_input.value
+    N = TP * DP
     B = int(_parse(batch_size_input))
-    N_ACTIVE = _parse(n_active_input)
-    L = _parse(seq_len_input)
     D = int(_parse(model_dim_input))
     F = int(_parse(ffn_dim_input))
-    TOKEN_BYTES_BF16 = 2
 
-    # --- Single-chip roofline ---
-    computation_flops = 2 * B * N_ACTIVE
-    communication_bytes = N_ACTIVE + B * L * TOKEN_BYTES_BF16
+    selected = chip_select.value or []
 
-    t_math = computation_flops / flops
-    t_memory = communication_bytes / hbm_bandwidth
-    t_lower = max(t_math, t_memory)
-    t_upper = t_math + t_memory
-    bound = "COMPUTE" if t_math > t_memory else "MEMORY"
+    chip_results = []
+    for chip_name in selected:
+        spec = PRESETS[chip_name]
+        chip_flops = spec["bf16_flops"]
+        chip_hbm = spec["hbm_bw"]
+        chip_ici = spec["ici_bw"]
 
-    ridge_mem = flops / hbm_bandwidth
-    ridge_net = flops / ici_bandwidth
+        ridge_mem = chip_flops / chip_hbm
+        ridge_net = chip_flops / chip_ici
 
-    # --- Multi-chip roofline (per strategy) ---
-    multi_chip_results = {}
-    for _strategy in strategies:
-        if _strategy == "Tensor Parallel":
-            per_chip_flops = 2 * B * D * F / N
-            allreduce_bytes = 2 * (N - 1) / N * (2 * B * F) if N > 1 else 0
-            net_intensity_val = D / 2 if N > 1 else float('inf')
-            net_intensity_label = "D/2"
+        per_chip_flops = 2 * (B / DP) * D * F / TP
+        weight_bytes = 2 * D * F / TP
+        allreduce_bytes = 2 * (TP - 1) / TP * (2 * (B / DP) * F) if TP > 1 else 0
+
+        t_math = per_chip_flops / chip_flops
+        t_mem = weight_bytes / chip_hbm
+        t_net = allreduce_bytes / chip_ici if TP > 1 else 0
+
+        t_lower = max(t_math, t_mem, t_net)
+        t_upper = t_math + t_mem + t_net
+
+        if t_math >= t_mem and t_math >= t_net:
+            regime = "COMPUTE"
+        elif t_net > t_mem:
+            regime = "NETWORK"
         else:
-            per_chip_flops = 2 * (B / N) * N_ACTIVE
-            allreduce_bytes = 2 * (N - 1) / N * (N_ACTIVE * 2) if N > 1 else 0
-            net_intensity_val = (B / N) if N > 1 else float('inf')
-            net_intensity_label = "B/N"
+            regime = "MEMORY"
 
-        t_math_net = per_chip_flops / flops
-        t_comms_net = allreduce_bytes / ici_bandwidth
-        t_lower_net = max(t_math_net, t_comms_net)
-        t_upper_net = t_math_net + t_comms_net
-        net_bound = "COMPUTE" if t_math_net > t_comms_net else "NETWORK"
+        chip_results.append({
+            "chip": chip_name,
+            "chip_flops": chip_flops,
+            "chip_hbm": chip_hbm,
+            "chip_ici": chip_ici,
+            "t_math": t_math,
+            "t_mem": t_mem,
+            "t_net": t_net,
+            "t_lower": t_lower,
+            "t_upper": t_upper,
+            "regime": regime,
+            "ridge_mem": ridge_mem,
+            "ridge_net": ridge_net,
+        })
 
-        multi_chip_results[_strategy] = {
-            "per_chip_flops": per_chip_flops,
-            "allreduce_bytes": allreduce_bytes,
-            "t_math_net": t_math_net,
-            "t_comms_net": t_comms_net,
-            "t_lower_net": t_lower_net,
-            "t_upper_net": t_upper_net,
-            "net_bound": net_bound,
-            "net_intensity_val": net_intensity_val,
-            "net_intensity_label": net_intensity_label,
-        }
-    return (
-        N,
-        bound,
-        communication_bytes,
-        computation_flops,
-        multi_chip_results,
-        ridge_mem,
-        ridge_net,
-        t_lower,
-        t_math,
-        t_memory,
-        t_upper,
-    )
+    return chip_results, N
 
 
 @app.cell
-def _(
-    batch_size_input,
-    bf16_flops_input,
-    chip_dropdown,
-    ffn_dim_input,
-    hbm_bw_input,
-    ici_bw_input,
-    mo,
-    model_dim_input,
-    n_active_input,
-    n_chips_input,
-    seq_len_input,
-    sharding_select,
-):
+def _(chip_select, dp_input, mo, tp_input):
     mo.vstack([
-        mo.md("**Chip**"),
-        mo.hstack([chip_dropdown, bf16_flops_input, hbm_bw_input, ici_bw_input], justify="start", gap=1),
-        mo.md("**Cluster**"),
-        mo.hstack([n_chips_input, sharding_select], justify="start", gap=1),
-        mo.md("**Workload**"),
-        mo.hstack([batch_size_input, n_active_input, seq_len_input, model_dim_input, ffn_dim_input], justify="start", gap=1),
+        chip_select,
+        mo.md("**Mesh**"),
+        mo.hstack([tp_input, dp_input], justify="start", gap=1),
     ])
     return
 
 
 @app.cell
-def _(N, bound, communication_bytes, computation_flops, mo, multi_chip_results, ridge_mem, ridge_net, t_lower, t_math, t_memory, t_upper):
-    def _results_table(label, rows):
-        header = f"**{label}**\n\n| | |\n|---|---|\n"
-        body = "\n".join(f"| {k} | `{v}` |" for k, v in rows)
-        return mo.md(header + body)
+def _(chip_results, mo, N):
+    import pandas as _pd
 
-    single_chip = _results_table("Single-Chip Roofline", [
-        ("Computation FLOPs", f"{computation_flops:.2e}"),
-        ("Communication Bytes", f"{communication_bytes:.2e}"),
-        ("T_math", f"{t_math:.4f} s"),
-        ("T_mem", f"{t_memory:.4f} s"),
-        ("T_exec", f"[{t_lower:.4f}, {t_upper:.4f}] s"),
-        ("**Regime**", f"**{bound}-bound**"),
-        ("Memory ridge point", f"{ridge_mem:.0f} FLOPs/byte"),
-    ])
+    rows = []
+    for r in chip_results:
+        rows.append({
+            "Chip": r["chip"],
+            "Chips": N,
+            "FLOPs/s": f"{r['chip_flops']:.2e}",
+            "HBM BW": f"{r['chip_hbm']:.2e}",
+            "ICI BW": f"{r['chip_ici']:.2e}",
+            "T_math": f"{r['t_math']:.2e} s",
+            "T_mem": f"{r['t_mem']:.2e} s",
+            "T_net": f"{r['t_net']:.2e} s" if r["t_net"] > 0 else "—",
+            "T_exec": f"[{r['t_lower']:.2e}, {r['t_upper']:.2e}] s",
+            "Regime": f"{r['regime']}-bound",
+            "Mem Ridge": f"{r['ridge_mem']:.0f}",
+            "Net Ridge": f"{r['ridge_net']:.0f}",
+        })
 
-    strategy_cards = []
-    if N > 1:
-        for strat, r in multi_chip_results.items():
-            card = _results_table(f"{strat} ({N} chips)", [
-                ("Per-chip FLOPs", f"{r['per_chip_flops']:.2e}"),
-                ("All-reduce bytes", f"{r['allreduce_bytes']:.2e}"),
-                ("T_math (per chip)", f"{r['t_math_net']:.6f} s"),
-                ("T_comms", f"{r['t_comms_net']:.6f} s"),
-                ("T_exec", f"[{r['t_lower_net']:.6f}, {r['t_upper_net']:.6f}] s"),
-                ("**Regime**", f"**{r['net_bound']}-bound**"),
-                ("Network ridge point", f"{ridge_net:.0f} FLOPs/byte"),
-                (f"Intensity ({r['net_intensity_label']})", f"{r['net_intensity_val']:.0f}"),
-                ("Compute-bound when", f"{r['net_intensity_label']} > {ridge_net:.0f}"),
-            ])
-            strategy_cards.append(card)
-
-    mo.hstack([single_chip] + strategy_cards, justify="start", gap=2)
+    mo.ui.table(_pd.DataFrame(rows), show_column_summaries=False, selection=None) if rows else None
     return
 
 
