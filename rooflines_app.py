@@ -14,17 +14,41 @@ def _(mo):
 
 @app.cell
 def _(mo):
+    import urllib.request as _req
+    import json as _json
+
+    _TRENDING_URL = "https://huggingface.co/api/models?sort=trendingScore&direction=-1&limit=30&filter=text-generation"
+    try:
+        with _req.urlopen(_TRENDING_URL, timeout=10) as _r:
+            _trending = [m["id"] for m in _json.loads(_r.read())]
+    except Exception:
+        _trending = [
+            "deepseek-ai/DeepSeek-V3",
+            "google/gemma-4-31B",
+            "meta-llama/Llama-4-Scout-17B-16E",
+            "mistralai/Mistral-Small-3.2-24B-Instruct-2506",
+            "Qwen/Qwen3-235B-A22B",
+        ]
+
+    import pandas as _pd
+
     model_id_input = mo.ui.text(
-        value="google/gemma-4-31B",
+        value=_trending[0],
         label="HuggingFace model ID",
         full_width=True,
     )
+    trending_table = mo.ui.table(
+        _pd.DataFrame({"model": _trending}),
+        selection="single",
+        label="Trending models (click to select)",
+        show_column_summaries=False,
+    )
     fetch_button = mo.ui.run_button(label="Fetch")
-    return fetch_button, model_id_input
+    return fetch_button, model_id_input, trending_table
 
 
 @app.cell
-def _(fetch_button, model_id_input):
+def _(fetch_button, model_id_input, trending_table):
     import urllib.request
     import json as _json
 
@@ -52,7 +76,7 @@ def _(fetch_button, model_id_input):
         num_layers = cfg.get("num_hidden_layers", 32)
         num_experts = cfg.get("num_local_experts") or cfg.get("n_routed_experts")
         experts_per_tok = cfg.get("num_experts_per_tok")
-        n_shared_experts = cfg.get("n_shared_experts", 0)
+        n_shared_experts = cfg.get("n_shared_experts") or 0
 
         if total_params and num_experts and experts_per_tok:
             active_params = total_params * (experts_per_tok + n_shared_experts) / num_experts
@@ -72,17 +96,30 @@ def _(fetch_button, model_id_input):
             "active_params": active_params,
         }, None
 
-    hf_spec, hf_error = _fetch_hf(model_id_input.value)
+    _selected = trending_table.value
+    _effective_model = _selected["model"].iloc[0] if len(_selected) > 0 else model_id_input.value
+    hf_spec, hf_error = _fetch_hf(_effective_model)
     return hf_error, hf_spec
 
 
 @app.cell
-def _(batch_size_input, fetch_button, ffn_dim_input, hf_error, hf_spec, mo, model_dim_input, model_id_input, n_active_input):
+def _(
+    batch_size_input,
+    fetch_button,
+    ffn_dim_input,
+    hf_error,
+    hf_spec,
+    mo,
+    model_dim_input,
+    model_id_input,
+    n_active_input,
+    trending_table,
+):
     import pandas as pd
 
     search_bar = mo.hstack([model_id_input, fetch_button], justify="start", gap=1, widths=[4, 1])
     workload = mo.hstack([batch_size_input, n_active_input, model_dim_input, ffn_dim_input], justify="start", gap=1)
-    left_col = mo.vstack([search_bar, workload])
+    left_col = mo.vstack([search_bar, trending_table, workload])
 
     _card = None
     if hf_error:
@@ -122,11 +159,20 @@ def _(mo):
         PRESETS = _json.loads(_open_url(_REMOTE).read())
 
     chip_select = mo.ui.multiselect(
-        options=list(PRESETS.keys()),
+        options=["Custom"] + list(PRESETS.keys()),
         value=["H100"] if "H100" in PRESETS else [list(PRESETS.keys())[0]],
         label="Chips",
     )
-    return PRESETS, chip_select
+    custom_flops_input = mo.ui.text(value="1.00e+15", label="FLOPs/s")
+    custom_hbm_input = mo.ui.text(value="3.35e+12", label="HBM BW (B/s)")
+    custom_ici_input = mo.ui.text(value="9.00e+11", label="ICI BW (B/s)")
+    return (
+        PRESETS,
+        chip_select,
+        custom_flops_input,
+        custom_hbm_input,
+        custom_ici_input,
+    )
 
 
 @app.cell
@@ -144,16 +190,27 @@ def _(hf_spec, mo):
     ffn_dim_input = mo.ui.text(value=F_default, label="FFN dim (F)")
     return (
         batch_size_input,
+        dp_input,
         ffn_dim_input,
         model_dim_input,
-        dp_input,
         n_active_input,
         tp_input,
     )
 
 
 @app.cell
-def _(PRESETS, batch_size_input, chip_select, dp_input, ffn_dim_input, model_dim_input, tp_input):
+def _(
+    PRESETS,
+    batch_size_input,
+    chip_select,
+    custom_flops_input,
+    custom_hbm_input,
+    custom_ici_input,
+    dp_input,
+    ffn_dim_input,
+    model_dim_input,
+    tp_input,
+):
     def _parse(text_input):
         try:
             return float(text_input.value)
@@ -171,10 +228,15 @@ def _(PRESETS, batch_size_input, chip_select, dp_input, ffn_dim_input, model_dim
 
     chip_results = []
     for chip_name in selected:
-        spec = PRESETS[chip_name]
-        chip_flops = spec["bf16_flops"]
-        chip_hbm = spec["hbm_bw"]
-        chip_ici = spec["ici_bw"]
+        if chip_name == "Custom":
+            chip_flops = float(custom_flops_input.value)
+            chip_hbm = float(custom_hbm_input.value)
+            chip_ici = float(custom_ici_input.value)
+        else:
+            spec = PRESETS[chip_name]
+            chip_flops = spec["bf16_flops"]
+            chip_hbm = spec["hbm_bw"]
+            chip_ici = spec["ici_bw"]
 
         ridge_mem = chip_flops / chip_hbm
         ridge_net = chip_flops / chip_ici
@@ -211,14 +273,23 @@ def _(PRESETS, batch_size_input, chip_select, dp_input, ffn_dim_input, model_dim
             "ridge_mem": ridge_mem,
             "ridge_net": ridge_net,
         })
-
-    return chip_results, N
+    return N, chip_results
 
 
 @app.cell
-def _(chip_select, dp_input, mo, tp_input):
+def _(
+    chip_select,
+    custom_flops_input,
+    custom_hbm_input,
+    custom_ici_input,
+    dp_input,
+    mo,
+    tp_input,
+):
+    _custom_row = mo.hstack([custom_flops_input, custom_hbm_input, custom_ici_input], justify="start", gap=1)
     mo.vstack([
         chip_select,
+        *([_custom_row] if "Custom" in (chip_select.value or []) else []),
         mo.md("**Mesh**"),
         mo.hstack([tp_input, dp_input], justify="start", gap=1),
     ])
@@ -226,7 +297,7 @@ def _(chip_select, dp_input, mo, tp_input):
 
 
 @app.cell
-def _(chip_results, mo, N):
+def _(N, chip_results, mo):
     import pandas as _pd
 
     rows = []
