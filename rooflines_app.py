@@ -103,6 +103,8 @@ def _(hf_error, hf_spec, mo):
 def _(mo):
     import json as _json
 
+    _REMOTE = "https://raw.githubusercontent.com/clankur/rooflines/main/accelerators.json"
+
     try:
         from pathlib import Path as _Path
         _specs_path = _Path(__file__).parent / "accelerators.json"
@@ -110,7 +112,7 @@ def _(mo):
             PRESETS = _json.load(f)
     except Exception:
         from pyodide.http import open_url as _open_url
-        PRESETS = _json.loads(_open_url("./accelerators.json").read())
+        PRESETS = _json.loads(_open_url(_REMOTE).read())
 
     chip_dropdown = mo.ui.dropdown(
         options=list(PRESETS.keys()),
